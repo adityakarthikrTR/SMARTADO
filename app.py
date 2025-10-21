@@ -12,7 +12,9 @@ from ado_parser import parse_ado_url
 from ado_client import AzureDevOpsClient
 from ai_analyzer import WorkItemAnalyzer
 from chatbot import WorkItemChatbot
+from sprint_dashboard import SprintAnalytics, MultiSprintAnalytics
 import json
+import pandas as pd
 
 # Load environment variables
 load_dotenv()
@@ -255,6 +257,64 @@ def collect_all_work_items(hierarchy):
     return all_items
 
 
+def collect_all_related_items(hierarchy, ado_client):
+    """
+    Collect all work items in the complete hierarchy tree including grandchildren.
+
+    For Epic with Stories and Tasks, this returns:
+    - The main work item (Epic)
+    - All parents (if any)
+    - All children (User Stories)
+    - All grandchildren (Tasks under User Stories)
+    - All related items (Bugs, dependencies)
+
+    Args:
+        hierarchy: Work item hierarchy dict
+        ado_client: AzureDevOpsClient instance
+
+    Returns:
+        list: All related work items
+    """
+    all_items = []
+    processed_ids = set()  # Avoid duplicates
+
+    def add_item(item):
+        """Add item if not already processed"""
+        item_id = item.get('id')
+        if item_id and item_id not in processed_ids:
+            all_items.append(item)
+            processed_ids.add(item_id)
+
+    # Add main work item
+    main_item = hierarchy['main']
+    add_item(main_item)
+
+    # Add all parents
+    for parent in hierarchy.get('parents', []):
+        add_item(parent['data'])
+
+    # Add all children and their children (grandchildren)
+    for child in hierarchy.get('children', []):
+        child_data = child['data']
+        add_item(child_data)
+
+        # Fetch grandchildren (e.g., Tasks under User Story)
+        try:
+            child_id = child_data.get('id')
+            if child_id:
+                child_hierarchy = ado_client.get_work_item_hierarchy(child_id)
+                for grandchild in child_hierarchy.get('children', []):
+                    add_item(grandchild['data'])
+        except:
+            pass  # Skip if grandchild fetch fails
+
+    # Add related items
+    for related in hierarchy.get('related', []):
+        add_item(related['data'])
+
+    return all_items
+
+
 def main():
     """Main application"""
 
@@ -312,6 +372,21 @@ def main():
         st.markdown("- ✅ Tasks")
         st.markdown("- 🐛 Bugs")
 
+    # Create tabs for different features
+    tab1, tab2 = st.tabs(["🔍 Work Item Analyzer", "📊 Sprint Dashboard"])
+
+    # TAB 1: Work Item Analyzer (existing functionality)
+    with tab1:
+        render_work_item_analyzer()
+
+    # TAB 2: Sprint Dashboard (new functionality)
+    with tab2:
+        render_sprint_dashboard()
+
+
+def render_work_item_analyzer():
+    """Render the Work Item Analyzer tab (original functionality)"""
+
     # Main input
     ado_url = st.text_input(
         "🔗 Paste Azure DevOps URL",
@@ -349,6 +424,10 @@ def main():
         # Store in session state
         st.session_state.current_hierarchy = hierarchy
         st.session_state.current_work_item_id = work_item_id
+
+        # Collect all related items for filtered dashboard view
+        st.session_state.filtered_work_items = collect_all_related_items(hierarchy, st.session_state.ado_client)
+        st.session_state.filter_mode = 'work_item'
 
     # Display the work item analysis if hierarchy exists in session state
     if st.session_state.current_hierarchy:
@@ -446,6 +525,9 @@ def main():
             file_name=f"solution_{hierarchy['main'].get('id')}.txt",
             mime="text/plain"
         )
+
+        # Notify user about filtered dashboard
+        st.info("💡 **Tip:** Switch to the '📊 Sprint Dashboard' tab to see metrics and graphs for this work item and its associated items!")
 
         # Store solution in session for chatbot
         st.session_state.current_solution = solution
@@ -926,6 +1008,855 @@ Now answer the user's question intelligently and comprehensively using ALL the c
         # Raw JSON view (collapsible)
         with st.expander("🔍 View Raw JSON Data"):
             st.json(hierarchy['main'])
+
+
+def render_filtered_dashboard():
+    """Render dashboard filtered to analyzed work item and its related items"""
+
+    filtered_items = st.session_state.filtered_work_items
+    hierarchy = st.session_state.current_hierarchy
+    main_item = hierarchy['main']
+
+    # Display what we're viewing
+    main_id = main_item.get('id')
+    main_type = main_item['fields']['System.WorkItemType']
+    main_title = main_item['fields']['System.Title']
+
+    st.success(f"📌 **Filtered View:** {main_type} #{main_id} - {main_title}")
+
+    # Add toggle button
+    col1, col2 = st.columns([4, 1])
+    with col2:
+        if st.button("🔄 View Full Sprint"):
+            st.session_state.filter_mode = 'sprint'
+            st.rerun()
+
+    st.markdown("---")
+
+    # Show scope summary
+    st.markdown("### 🌳 Work Item Scope")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    parent_count = len(hierarchy.get('parents', []))
+    child_count = len(hierarchy.get('children', []))
+    related_count = len(hierarchy.get('related', []))
+
+    # Count grandchildren
+    grandchild_count = 0
+    for child in hierarchy.get('children', []):
+        child_id = child['data'].get('id')
+        try:
+            child_hier = st.session_state.ado_client.get_work_item_hierarchy(child_id)
+            grandchild_count += len(child_hier.get('children', []))
+        except:
+            pass
+
+    with col1:
+        st.metric("Parents", parent_count)
+
+    with col2:
+        st.metric("Main Item", 1, help=f"{main_type} #{main_id}")
+
+    with col3:
+        total_children = child_count + grandchild_count
+        st.metric("Children & Descendants", total_children)
+
+    with col4:
+        st.metric("Related Items", related_count)
+
+    st.markdown("---")
+
+    # Calculate metrics using ONLY filtered items
+    analytics = SprintAnalytics(filtered_items, iteration_data=None)
+    metrics = analytics.calculate_metrics()
+
+    # Display key metrics
+    st.markdown("### 📈 Key Metrics")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        if main_type in ['Epic', 'Feature', 'User Story']:
+            st.metric(
+                label="📊 Story Points",
+                value=f"{metrics['completed_points']:.0f} / {metrics['total_points']:.0f}",
+                delta=f"{metrics['completion_rate']:.1f}% complete"
+            )
+        else:
+            st.metric(
+                label="📊 Total Items",
+                value=metrics['total_items']
+            )
+
+    with col2:
+        st.metric(
+            label="✅ Completed",
+            value=f"{metrics['closed_items']} / {metrics['total_items']}",
+            delta=f"{metrics['item_completion_rate']:.1f}%"
+        )
+
+    with col3:
+        scope_desc = {
+            'Epic': 'User Stories',
+            'Feature': 'User Stories',
+            'User Story': 'Tasks',
+            'Task': 'Subtasks'
+        }.get(main_type, 'Items')
+
+        st.metric(
+            label=f"📋 {scope_desc}",
+            value=child_count + grandchild_count
+        )
+
+    with col4:
+        health_status = metrics['health_status']
+        health_emoji = {'green': '🟢', 'yellow': '🟡', 'red': '🔴', 'unknown': '⚪'}
+        health_text = {'green': 'On Track', 'yellow': 'At Risk', 'red': 'Behind', 'unknown': 'N/A'}
+
+        st.metric(
+            label="🎯 Status",
+            value=health_text.get(health_status, 'Unknown'),
+            delta=health_emoji.get(health_status, '⚪')
+        )
+
+    st.markdown("---")
+
+    # Visualizations
+    st.markdown("### 📊 Visualizations")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### 📋 Work Item Status")
+        state_counts = metrics['state_counts']
+
+        if state_counts:
+            filtered_states = {k: v for k, v in state_counts.items() if v > 0}
+            if filtered_states:
+                state_df = pd.DataFrame({
+                    'State': list(filtered_states.keys()),
+                    'Count': list(filtered_states.values())
+                })
+                st.bar_chart(state_df.set_index('State'), use_container_width=True)
+        else:
+            st.info("No state data available")
+
+    with col2:
+        st.markdown("#### 🎨 Work Item Types")
+        type_counts = metrics['type_counts']
+
+        if type_counts:
+            type_df = pd.DataFrame({
+                'Type': list(type_counts.keys()),
+                'Count': list(type_counts.values())
+            })
+            st.bar_chart(type_df.set_index('Type'), use_container_width=True)
+        else:
+            st.info("No type data available")
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### 👥 Team Distribution")
+        assignee_counts = metrics['assignee_counts']
+
+        if assignee_counts:
+            assignee_df = pd.DataFrame(list(assignee_counts.items()), columns=['Assignee', 'Count'])
+            st.bar_chart(assignee_df.set_index('Assignee'), use_container_width=True)
+        else:
+            st.info("No assignee data available")
+
+    with col2:
+        st.markdown("#### 📊 Completion Progress")
+
+        completed = metrics['closed_items']
+        remaining = metrics['total_items'] - completed
+
+        if metrics['total_items'] > 0:
+            progress_data = {
+                'Status': ['Completed', 'Remaining'],
+                'Count': [completed, remaining]
+            }
+            progress_df = pd.DataFrame(progress_data)
+            st.bar_chart(progress_df.set_index('Status'), use_container_width=True)
+
+    st.markdown("---")
+
+    # Work Items Table
+    st.markdown("### 📋 Work Items in Scope")
+
+    table_data = []
+    for wi in filtered_items:
+        fields = wi.get('fields', {})
+
+        assigned_to = fields.get('System.AssignedTo', {})
+        if isinstance(assigned_to, dict):
+            assignee_name = assigned_to.get('displayName', 'Unassigned')
+        else:
+            assignee_name = 'Unassigned'
+
+        story_points = fields.get('Microsoft.VSTS.Scheduling.StoryPoints', 0) or 0
+
+        table_data.append({
+            'ID': wi.get('id'),
+            'Type': fields.get('System.WorkItemType', 'Unknown'),
+            'Title': fields.get('System.Title', 'Untitled'),
+            'State': fields.get('System.State', 'Unknown'),
+            'Assigned To': assignee_name,
+            'Story Points': story_points
+        })
+
+    if table_data:
+        df = pd.DataFrame(table_data)
+
+        # Add filters
+        col1, col2 = st.columns(2)
+
+        with col1:
+            type_filter = st.multiselect(
+                "Filter by Type",
+                options=df['Type'].unique(),
+                default=df['Type'].unique()
+            )
+
+        with col2:
+            state_filter = st.multiselect(
+                "Filter by State",
+                options=df['State'].unique(),
+                default=df['State'].unique()
+            )
+
+        # Apply filters
+        filtered_df = df[
+            (df['Type'].isin(type_filter)) &
+            (df['State'].isin(state_filter))
+        ]
+
+        st.dataframe(
+            filtered_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Export
+        csv = filtered_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download as CSV",
+            data=csv,
+            file_name=f"work_item_{main_id}_scope.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No work items to display")
+
+    st.markdown("---")
+
+    # AI Analysis for filtered items
+    st.markdown("### 🤖 AI Analysis")
+
+    with st.expander("🧠 Generate Analysis for This Scope", expanded=False):
+        if st.button("Generate Analysis", type="primary"):
+            # Prepare context
+            context = f"""
+**Main Work Item:** {main_type} #{main_id} - {main_title}
+
+**Scope:**
+- Total Items: {len(filtered_items)}
+- Parents: {parent_count}
+- Children: {child_count + grandchild_count}
+- Related: {related_count}
+
+**Progress:**
+- Story Points: {metrics['completed_points']:.0f} / {metrics['total_points']:.0f} ({metrics['completion_rate']:.1f}%)
+- Items Completed: {metrics['closed_items']} / {metrics['total_items']} ({metrics['item_completion_rate']:.1f}%)
+- Status: {health_text.get(health_status, 'Unknown')}
+
+**Team:**
+{', '.join([f"{name} ({count} items)" for name, count in list(assignee_counts.items())[:5]])}
+"""
+
+            system_prompt = f"""You are an Agile coach analyzing a {main_type} and all its related work items.
+Provide insights on:
+1. Overall progress and health
+2. Completion timeline estimate
+3. Potential blockers or risks
+4. Recommendations for the team
+
+Be specific and actionable."""
+
+            user_prompt = f"""Analyze this work item scope:
+
+{context}
+
+Provide comprehensive analysis with recommendations."""
+
+            with st.spinner("🤖 Analyzing..."):
+                try:
+                    from litellm import completion
+
+                    response = completion(
+                        model=os.getenv('LITELLM_MODEL', 'gpt-4'),
+                        api_base=os.getenv('LITELLM_API_BASE'),
+                        api_key=os.getenv('LITELLM_API_KEY'),
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.3
+                    )
+
+                    st.markdown(response.choices[0].message.content)
+
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    st.info("Please check your LiteLLM connection and VPN status.")
+
+
+def render_sprint_dashboard():
+    """Render the Sprint Dashboard tab with analytics and visualizations"""
+
+    st.markdown("## 📊 Sprint Analytics Dashboard")
+
+    # Check if we should show filtered view for a specific work item
+    if 'filtered_work_items' in st.session_state and st.session_state.get('filter_mode') == 'work_item':
+        render_filtered_dashboard()
+        return
+
+    # Otherwise show full sprint dashboard
+    st.markdown("Visualize sprint progress, team velocity, and work distribution")
+    st.markdown("---")
+
+    # Add option to go back to filtered view if available
+    if 'filtered_work_items' in st.session_state:
+        col1, col2 = st.columns([4, 1])
+        with col2:
+            if st.button("📌 Back to Work Item View"):
+                st.session_state.filter_mode = 'work_item'
+                st.rerun()
+
+    # Fetch available iterations
+    with st.spinner("🔄 Fetching sprints/iterations..."):
+        iterations = st.session_state.ado_client.get_all_iterations()
+
+    if not iterations:
+        st.warning("⚠️ No iterations found for this project. Please check your Azure DevOps configuration.")
+        st.info("**Troubleshooting:**\n- Ensure your project has sprints/iterations configured\n- Check your Azure DevOps PAT has correct permissions\n- Verify the project name in your .env file")
+        return
+
+    # Sprint Selection
+    st.markdown("### 🎯 Select Sprint/Iteration")
+
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        # Create dropdown options
+        iteration_options = {}
+        for iteration in iterations:
+            iter_name = iteration.get('name', 'Unknown')
+            iter_path = iteration.get('path', '')
+            attributes = iteration.get('attributes', {})
+            start_date = attributes.get('startDate', '')
+            end_date = attributes.get('finishDate', '')
+
+            # Format display name
+            if start_date and end_date:
+                try:
+                    start = start_date[:10]
+                    end = end_date[:10]
+                    display_name = f"{iter_name} ({start} to {end})"
+                except:
+                    display_name = iter_name
+            else:
+                display_name = iter_name
+
+            iteration_options[display_name] = iteration
+
+        selected_iteration_name = st.selectbox(
+            "Choose a sprint:",
+            options=list(iteration_options.keys()),
+            help="Select a sprint/iteration to view analytics"
+        )
+
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        refresh_button = st.button("🔄 Refresh Data", help="Clear cache and refresh sprint data")
+
+    if refresh_button:
+        st.cache_data.clear()
+        st.rerun()
+
+    # Get selected iteration data
+    selected_iteration = iteration_options[selected_iteration_name]
+    iteration_path = selected_iteration.get('path', '')
+
+    st.markdown("---")
+
+    # Fetch work items for selected sprint
+    with st.spinner(f"📥 Fetching work items for {selected_iteration.get('name')}..."):
+        sprint_work_items = st.session_state.ado_client.get_sprint_work_items(iteration_path)
+
+    if not sprint_work_items:
+        st.info(f"📭 No work items found in sprint: **{selected_iteration.get('name')}**")
+        st.markdown("This sprint might be empty or work items might not be assigned to this iteration yet.")
+        return
+
+    # Initialize Analytics
+    analytics = SprintAnalytics(sprint_work_items, selected_iteration)
+    metrics = analytics.calculate_metrics()
+
+    # Display Key Metrics Cards
+    st.markdown("### 📈 Key Metrics")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric(
+            label="📊 Story Points",
+            value=f"{metrics['completed_points']:.0f} / {metrics['total_points']:.0f}",
+            delta=f"{metrics['completion_rate']:.1f}% complete",
+            delta_color="normal"
+        )
+
+    with col2:
+        st.metric(
+            label="✅ Work Items",
+            value=f"{metrics['closed_items']} / {metrics['total_items']}",
+            delta=f"{metrics['item_completion_rate']:.1f}% closed",
+            delta_color="normal"
+        )
+
+    with col3:
+        sprint_progress = metrics['sprint_progress']
+        st.metric(
+            label="📅 Sprint Progress",
+            value=f"{sprint_progress.get('days_elapsed', 0)} / {sprint_progress.get('days_total', 0)} days",
+            delta=f"{sprint_progress.get('progress_pct', 0):.1f}% elapsed",
+            delta_color="normal"
+        )
+
+    with col4:
+        # Health indicator
+        health_status = metrics['health_status']
+        health_emoji = {'green': '🟢', 'yellow': '🟡', 'red': '🔴', 'unknown': '⚪'}
+        health_text = {'green': 'On Track', 'yellow': 'At Risk', 'red': 'Behind', 'unknown': 'Unknown'}
+
+        st.metric(
+            label="🎯 Sprint Health",
+            value=health_text.get(health_status, 'Unknown'),
+            delta=health_emoji.get(health_status, '⚪')
+        )
+
+    st.markdown("---")
+
+    # Visualizations Row
+    st.markdown("### 📊 Sprint Visualizations")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Burndown Chart
+        st.markdown("#### 🔥 Burndown Chart")
+        ideal_burndown, actual_burndown = analytics.generate_burndown_data()
+
+        if ideal_burndown and actual_burndown:
+            # Create DataFrame for chart
+            days = list(range(len(ideal_burndown)))
+            burndown_df = pd.DataFrame({
+                'Day': days,
+                'Ideal': ideal_burndown,
+                'Actual': actual_burndown[:len(days)]
+            })
+            burndown_df = burndown_df.set_index('Day')
+
+            st.line_chart(burndown_df, use_container_width=True)
+        else:
+            st.info("Not enough data to display burndown chart")
+
+    with col2:
+        # Work Item Status Distribution
+        st.markdown("#### 📋 Work Item Status")
+        state_counts = metrics['state_counts']
+
+        if state_counts:
+            # Filter out zero counts
+            filtered_states = {k: v for k, v in state_counts.items() if v > 0}
+
+            if filtered_states:
+                state_df = pd.DataFrame({
+                    'State': list(filtered_states.keys()),
+                    'Count': list(filtered_states.values())
+                })
+                st.bar_chart(state_df.set_index('State'), use_container_width=True)
+            else:
+                st.info("No work items to display")
+        else:
+            st.info("No state data available")
+
+    st.markdown("---")
+
+    # Work Item Type Breakdown
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### 🎨 Work Item Types")
+        type_counts = metrics['type_counts']
+
+        if type_counts:
+            type_df = pd.DataFrame({
+                'Type': list(type_counts.keys()),
+                'Count': list(type_counts.values())
+            })
+            st.bar_chart(type_df.set_index('Type'), use_container_width=True)
+        else:
+            st.info("No type data available")
+
+    with col2:
+        st.markdown("#### 👥 Work Distribution by Assignee")
+        assignee_counts = metrics['assignee_counts']
+
+        if assignee_counts:
+            # Show top 10 assignees
+            sorted_assignees = sorted(assignee_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            assignee_df = pd.DataFrame(sorted_assignees, columns=['Assignee', 'Count'])
+            st.bar_chart(assignee_df.set_index('Assignee'), use_container_width=True)
+        else:
+            st.info("No assignee data available")
+
+    st.markdown("---")
+
+    # AI Sprint Analysis
+    st.markdown("### 🤖 AI Sprint Analysis")
+
+    with st.expander("🧠 Generate AI Insights", expanded=False):
+        if st.button("Generate Sprint Analysis", type="primary"):
+            context = analytics.generate_ai_summary_context()
+
+            system_prompt = """You are a Scrum Master and Agile coach analyzing a sprint.
+Provide insights on:
+1. Sprint health and progress
+2. Potential risks and blockers
+3. Recommendations to complete the sprint successfully
+4. Team performance observations
+
+Be concise, actionable, and supportive."""
+
+            user_prompt = f"""Analyze this sprint and provide insights:
+
+{context}
+
+Provide a comprehensive sprint analysis with actionable recommendations."""
+
+            with st.spinner("🤖 AI is analyzing the sprint..."):
+                try:
+                    from litellm import completion
+
+                    response = completion(
+                        model=os.getenv('LITELLM_MODEL', 'gpt-4'),
+                        api_base=os.getenv('LITELLM_API_BASE'),
+                        api_key=os.getenv('LITELLM_API_KEY'),
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.3
+                    )
+
+                    ai_analysis = response.choices[0].message.content
+                    st.markdown(ai_analysis)
+
+                except Exception as e:
+                    st.error(f"Error generating AI analysis: {str(e)}")
+                    st.info("Please check your LiteLLM connection and VPN status.")
+
+    st.markdown("---")
+
+    # ADVANCED FEATURES SECTION
+    st.markdown("## 🚀 Advanced Analytics")
+
+    # Create tabs for advanced features
+    adv_tab1, adv_tab2, adv_tab3, adv_tab4 = st.tabs([
+        "📈 Velocity Trends",
+        "📊 Burnup Chart",
+        "🔮 Forecast",
+        "📑 Compare Sprints"
+    ])
+
+    # TAB 1: Velocity Trends
+    with adv_tab1:
+        st.markdown("#### 📈 Team Velocity Over Time")
+
+        # Get last 5 sprints for velocity tracking
+        with st.spinner("Fetching historical sprint data..."):
+            # Get up to 5 recent iterations
+            recent_iterations = iterations[-5:] if len(iterations) >= 5 else iterations
+
+            sprints_data = []
+            for iteration in recent_iterations:
+                iter_path = iteration.get('path', '')
+                iter_work_items = st.session_state.ado_client.get_sprint_work_items(iter_path)
+                sprints_data.append({
+                    'sprint_info': iteration,
+                    'work_items': iter_work_items
+                })
+
+            if len(sprints_data) > 1:
+                multi_analytics = MultiSprintAnalytics(sprints_data)
+                velocity_data = multi_analytics.calculate_velocity_trends()
+
+                # Display velocity trend
+                col1, col2 = st.columns([3, 1])
+
+                with col1:
+                    # Velocity line chart
+                    velocity_df = pd.DataFrame({
+                        'Sprint': velocity_data['sprint_names'],
+                        'Velocity (Story Points)': velocity_data['velocities']
+                    })
+                    st.line_chart(velocity_df.set_index('Sprint'), use_container_width=True)
+
+                with col2:
+                    # Velocity metrics
+                    st.metric(
+                        label="Average Velocity",
+                        value=f"{velocity_data['average_velocity']:.1f}",
+                        delta=velocity_data['trend'].capitalize()
+                    )
+
+                    trend_emoji = {
+                        'increasing': '📈',
+                        'decreasing': '📉',
+                        'stable': '➡️'
+                    }
+                    st.markdown(f"### {trend_emoji.get(velocity_data['trend'], '➡️')}")
+                    st.caption(f"Trend: **{velocity_data['trend'].capitalize()}**")
+
+                # Velocity insights
+                st.markdown("#### 💡 Insights")
+                if velocity_data['trend'] == 'increasing':
+                    st.success("✅ **Great!** Team velocity is increasing over time. The team is becoming more efficient.")
+                elif velocity_data['trend'] == 'decreasing':
+                    st.warning("⚠️ **Attention:** Team velocity is decreasing. Consider investigating potential blockers or capacity issues.")
+                else:
+                    st.info("➡️ Team velocity is stable. Consistent performance across sprints.")
+
+            else:
+                st.info("Need at least 2 sprints to show velocity trends. Complete more sprints to see this analysis.")
+
+    # TAB 2: Burnup Chart
+    with adv_tab2:
+        st.markdown("#### 📊 Sprint Burnup Chart")
+        st.caption("Shows work completed over time vs total scope")
+
+        total_scope, completed_work = analytics.generate_burnup_data()
+
+        if total_scope and completed_work:
+            days = list(range(len(total_scope)))
+            burnup_df = pd.DataFrame({
+                'Day': days,
+                'Total Scope': total_scope,
+                'Completed Work': completed_work[:len(days)]
+            })
+            burnup_df = burnup_df.set_index('Day')
+
+            st.line_chart(burnup_df, use_container_width=True)
+
+            # Burnup insights
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Scope", f"{total_scope[0]:.0f} pts")
+            with col2:
+                current_completed = completed_work[min(len(completed_work)-1, metrics['sprint_progress']['days_elapsed'])]
+                st.metric("Completed", f"{current_completed:.0f} pts")
+            with col3:
+                remaining = total_scope[0] - current_completed
+                st.metric("Remaining", f"{remaining:.0f} pts")
+
+        else:
+            st.info("Not enough data to display burnup chart")
+
+    # TAB 3: Forecast Completion
+    with adv_tab3:
+        st.markdown("#### 🔮 Sprint Completion Forecast")
+        st.caption("Predict if sprint will complete based on current velocity")
+
+        if len(sprints_data) > 1:
+            multi_analytics = MultiSprintAnalytics(sprints_data)
+
+            # Calculate current velocity
+            sprint_progress = metrics['sprint_progress']
+            days_elapsed = sprint_progress.get('days_elapsed', 1)
+            current_velocity = metrics['completed_points'] / days_elapsed if days_elapsed > 0 else 0
+            remaining_points = metrics['remaining_points']
+
+            prediction = multi_analytics.predict_completion(remaining_points, current_velocity)
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.metric(
+                    label="Current Velocity",
+                    value=f"{current_velocity:.1f} pts/day"
+                )
+                st.metric(
+                    label="Days Needed",
+                    value=f"{prediction['days_needed']:.1f} days"
+                )
+
+            with col2:
+                st.metric(
+                    label="Confidence",
+                    value=prediction['confidence'].capitalize()
+                )
+
+                if prediction['can_complete']:
+                    st.success("✅ **On track** to complete sprint!")
+                else:
+                    st.warning("⚠️ **At risk** - May not complete all work")
+
+            st.markdown("#### 📊 Forecast Details")
+            st.info(prediction['message'])
+
+            # Recommendations
+            st.markdown("#### 💡 Recommendations")
+            if not prediction['can_complete']:
+                st.markdown("""
+                - Consider reducing scope or deferring lower-priority items
+                - Identify and remove blockers affecting velocity
+                - Ensure team has adequate capacity
+                - Review work item complexity and re-estimate if needed
+                """)
+            else:
+                st.markdown("""
+                - Continue current pace
+                - Monitor for new blockers
+                - Consider taking on additional work if time permits
+                """)
+        else:
+            st.info("Need historical sprint data to generate forecast. Complete more sprints to see predictions.")
+
+    # TAB 4: Compare Sprints
+    with adv_tab4:
+        st.markdown("#### 📑 Sprint Comparison")
+        st.caption("Compare metrics across multiple sprints")
+
+        if len(sprints_data) > 1:
+            multi_analytics = MultiSprintAnalytics(sprints_data)
+            comparison = multi_analytics.compare_sprints()
+
+            # Create comparison DataFrame
+            comparison_df = pd.DataFrame({
+                'Sprint': comparison['sprint_names'],
+                'Total Points': comparison['total_points'],
+                'Completed Points': comparison['completed_points'],
+                'Completion %': comparison['completion_rates'],
+                'Total Items': comparison['total_items'],
+                'Closed Items': comparison['closed_items']
+            })
+
+            st.dataframe(
+                comparison_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Completion %": st.column_config.NumberColumn("Completion %", format="%.1f%%")
+                }
+            )
+
+            # Comparison charts
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**Story Points Comparison**")
+                points_df = pd.DataFrame({
+                    'Sprint': comparison['sprint_names'],
+                    'Completed': comparison['completed_points']
+                })
+                st.bar_chart(points_df.set_index('Sprint'), use_container_width=True)
+
+            with col2:
+                st.markdown("**Completion Rate Comparison**")
+                completion_df = pd.DataFrame({
+                    'Sprint': comparison['sprint_names'],
+                    'Completion %': comparison['completion_rates']
+                })
+                st.bar_chart(completion_df.set_index('Sprint'), use_container_width=True)
+
+            # Export comparison
+            csv = comparison_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Comparison as CSV",
+                data=csv,
+                file_name="sprint_comparison.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("Need at least 2 sprints to compare. Complete more sprints to see comparison.")
+
+    st.markdown("---")
+
+    # Work Items Table
+    st.markdown("### 📋 Sprint Work Items")
+
+    # Get table data
+    table_data = analytics.get_work_items_table_data()
+
+    if table_data:
+        df = pd.DataFrame(table_data)
+
+        # Add filters
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            type_filter = st.multiselect(
+                "Filter by Type",
+                options=df['Type'].unique(),
+                default=df['Type'].unique()
+            )
+
+        with col2:
+            state_filter = st.multiselect(
+                "Filter by State",
+                options=df['State'].unique(),
+                default=df['State'].unique()
+            )
+
+        with col3:
+            assignee_filter = st.multiselect(
+                "Filter by Assignee",
+                options=df['Assigned To'].unique(),
+                default=df['Assigned To'].unique()
+            )
+
+        # Apply filters
+        filtered_df = df[
+            (df['Type'].isin(type_filter)) &
+            (df['State'].isin(state_filter)) &
+            (df['Assigned To'].isin(assignee_filter))
+        ]
+
+        st.dataframe(
+            filtered_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "ID": st.column_config.NumberColumn("ID", format="%d"),
+                "Story Points": st.column_config.NumberColumn("Story Points", format="%.0f")
+            }
+        )
+
+        # Export button
+        csv = filtered_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download as CSV",
+            data=csv,
+            file_name=f"sprint_{selected_iteration.get('name', 'export')}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No work items to display")
 
 
 if __name__ == "__main__":

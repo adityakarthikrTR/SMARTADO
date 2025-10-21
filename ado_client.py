@@ -8,6 +8,7 @@ import os
 import requests
 import base64
 from typing import Dict, List, Optional
+from urllib.parse import quote
 import streamlit as st
 
 
@@ -26,7 +27,9 @@ class AzureDevOpsClient:
         self.organization = organization
         self.project = project
         self.pat = pat
-        self.base_url = f"https://dev.azure.com/{organization}/{project}/_apis"
+        # URL encode the project name to handle spaces
+        encoded_project = quote(project, safe='')
+        self.base_url = f"https://dev.azure.com/{organization}/{encoded_project}/_apis"
 
         # Create authorization header
         auth_string = f":{pat}"
@@ -258,6 +261,132 @@ class AzureDevOpsClient:
             'tags': self.get_work_item_tags(work_item),
             'url': work_item.get('_links', {}).get('html', {}).get('href', '')
         }
+
+    @st.cache_data(ttl=300)
+    def get_team_iterations(_self, team: str = None) -> List[Dict]:
+        """
+        Fetch all iterations/sprints for a team.
+
+        Args:
+            team: Team name (optional, uses project name if not provided)
+
+        Returns:
+            list: List of iterations with id, name, path, start/end dates
+        """
+        if not team:
+            team = _self.project
+
+        url = f"https://dev.azure.com/{_self.organization}/{quote(_self.project, safe='')}/_apis/work/teamsettings/iterations"
+        params = {
+            "api-version": "7.0",
+            "$timeframe": "current"
+        }
+
+        try:
+            response = requests.get(url, headers=_self.headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('value', [])
+        except Exception as e:
+            st.warning(f"Could not fetch iterations: {str(e)}")
+            return []
+
+    @st.cache_data(ttl=300)
+    def get_all_iterations(_self, team: str = None) -> List[Dict]:
+        """
+        Fetch ALL iterations (past, current, future) for a team.
+
+        Args:
+            team: Team name (optional, uses project name if not provided)
+
+        Returns:
+            list: List of all iterations
+        """
+        if not team:
+            team = _self.project
+
+        url = f"https://dev.azure.com/{_self.organization}/{quote(_self.project, safe='')}/_apis/work/teamsettings/iterations"
+        params = {"api-version": "7.0"}
+
+        try:
+            response = requests.get(url, headers=_self.headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('value', [])
+        except Exception as e:
+            st.warning(f"Could not fetch iterations: {str(e)}")
+            return []
+
+    @st.cache_data(ttl=120)
+    def query_work_items_by_wiql(_self, wiql_query: str) -> List[Dict]:
+        """
+        Execute a WIQL query and return full work item details.
+
+        Args:
+            wiql_query: WIQL query string
+
+        Returns:
+            list: List of work items
+        """
+        # Execute WIQL query
+        url = f"{_self.base_url}/wit/wiql"
+        params = {"api-version": "7.0"}
+        body = {"query": wiql_query}
+
+        try:
+            response = requests.post(url, headers=_self.headers, params=params, json=body)
+            response.raise_for_status()
+            query_result = response.json()
+
+            # Extract work item IDs
+            work_items = query_result.get('workItems', [])
+            if not work_items:
+                return []
+
+            work_item_ids = [str(wi['id']) for wi in work_items]
+
+            # Fetch full work item details (batch request)
+            if work_item_ids:
+                ids_param = ','.join(work_item_ids[:200])  # ADO limits to 200 per request
+                details_url = f"https://dev.azure.com/{_self.organization}/_apis/wit/workitems"
+                details_params = {
+                    "ids": ids_param,
+                    "$expand": "all",
+                    "api-version": "7.0"
+                }
+
+                details_response = requests.get(details_url, headers=_self.headers, params=details_params)
+                details_response.raise_for_status()
+                details_data = details_response.json()
+
+                return details_data.get('value', [])
+
+            return []
+
+        except Exception as e:
+            st.error(f"Error executing WIQL query: {str(e)}")
+            return []
+
+    def get_sprint_work_items(self, iteration_path: str) -> List[Dict]:
+        """
+        Get all work items for a specific sprint/iteration.
+
+        Args:
+            iteration_path: Full iteration path (e.g., "ProjectName\\2025\\Sprint 1")
+
+        Returns:
+            list: List of work items in the sprint
+        """
+        wiql_query = f"""
+        SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType],
+               [System.AssignedTo], [Microsoft.VSTS.Scheduling.StoryPoints]
+        FROM WorkItems
+        WHERE [System.IterationPath] = '{iteration_path}'
+        AND [System.TeamProject] = '{self.project}'
+        ORDER BY [System.WorkItemType], [System.State]
+        """
+
+        return self.query_work_items_by_wiql(wiql_query)
 
 
 # Test the client
