@@ -15,6 +15,8 @@ from chatbot import WorkItemChatbot
 from sprint_dashboard import SprintAnalytics, MultiSprintAnalytics
 import json
 import pandas as pd
+from urllib.parse import quote
+from typing import List, Dict
 
 # Load environment variables
 load_dotenv()
@@ -373,7 +375,7 @@ def main():
         st.markdown("- 🐛 Bugs")
 
     # Create tabs for different features
-    tab1, tab2 = st.tabs(["🔍 Work Item Analyzer", "📊 Sprint Dashboard"])
+    tab1, tab2, tab3 = st.tabs(["🔍 Work Item Analyzer", "📊 Sprint Dashboard", "👤 Person Search"])
 
     # TAB 1: Work Item Analyzer (existing functionality)
     with tab1:
@@ -382,6 +384,10 @@ def main():
     # TAB 2: Sprint Dashboard (new functionality)
     with tab2:
         render_sprint_dashboard()
+
+    # TAB 3: Person Search (new functionality)
+    with tab3:
+        render_person_search()
 
 
 def render_work_item_analyzer():
@@ -1857,6 +1863,376 @@ Provide a comprehensive sprint analysis with actionable recommendations."""
         )
     else:
         st.info("No work items to display")
+
+
+def render_person_search():
+    """Render the Person Search tab - search work items by assignee name"""
+
+    st.markdown("## 👤 Person Search")
+    st.markdown("Search for work items assigned to a specific person and view their ADO links and metrics.")
+
+    # Search input
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        person_name = st.text_input(
+            "🔍 Enter person's name",
+            placeholder="e.g., Aditya, John Smith, or john.smith@company.com",
+            help="Enter full or partial name. The search will find all matching assignees."
+        )
+
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        search_button = st.button("🔎 Search", type="primary")
+
+    # Perform search
+    if search_button and person_name:
+        if not person_name.strip():
+            st.warning("⚠️ Please enter a person's name to search.")
+            return
+
+        with st.spinner(f"🔄 Searching work items and dashboards for '{person_name}'..."):
+            try:
+                # Search work items by assignee
+                work_items = st.session_state.ado_client.get_work_items_by_assignee(person_name)
+
+                # Search dashboards by owner
+                dashboards = st.session_state.ado_client.get_dashboards_by_owner(person_name)
+
+                if not work_items and not dashboards:
+                    st.warning(f"❌ No work items or dashboards found for '{person_name}'. Please check the name and try again.")
+                    return
+
+                # Store in session state for dashboard view
+                st.session_state.person_work_items = work_items
+                st.session_state.person_dashboards = dashboards
+                st.session_state.person_search_name = person_name
+
+                # Display results
+                results_text = []
+                if work_items:
+                    results_text.append(f"**{len(work_items)}** work items")
+                if dashboards:
+                    results_text.append(f"**{len(dashboards)}** dashboards")
+                st.success(f"✅ Found {' and '.join(results_text)} for '{person_name}'")
+
+                # Extract unique assignee name from results (to get full name)
+                assignee_names = set()
+                for item in work_items:
+                    assignee = item.get('fields', {}).get('System.AssignedTo', {})
+                    if isinstance(assignee, dict):
+                        full_name = assignee.get('displayName', '')
+                        if full_name:
+                            assignee_names.add(full_name)
+
+                if assignee_names:
+                    st.info(f"📌 **Matched assignees:** {', '.join(assignee_names)}")
+
+                # Calculate metrics
+                if work_items:
+                    render_person_metrics(work_items, person_name)
+
+                # Display dashboards owned by person
+                if dashboards:
+                    render_person_dashboards(dashboards, person_name)
+
+                # Display work items with ADO links
+                if work_items:
+                    render_person_work_items(work_items)
+
+                # Option to view filtered dashboard
+                if work_items:
+                    st.markdown("---")
+                    st.markdown("### 📊 View Dashboard")
+                if st.button("🎯 View Filtered Dashboard for This Person", type="secondary"):
+                    # Set filter mode to person
+                    st.session_state.filter_mode = 'person'
+                    st.session_state.filtered_work_items = work_items
+                    # Switch to sprint dashboard tab would require rerun with tab selection
+                    st.info("💡 **Tip:** Switch to the '📊 Sprint Dashboard' tab to see detailed metrics and charts for this person's work items!")
+
+            except Exception as e:
+                st.error(f"❌ Error searching for work items: {str(e)}")
+                return
+
+    # If there's existing search results, show them
+    elif 'person_work_items' in st.session_state or 'person_dashboards' in st.session_state:
+        work_items = st.session_state.get('person_work_items', [])
+        dashboards = st.session_state.get('person_dashboards', [])
+        person_name = st.session_state.get('person_search_name', 'Unknown')
+
+        # Display results summary
+        results_text = []
+        if work_items:
+            results_text.append(f"**{len(work_items)}** work items")
+        if dashboards:
+            results_text.append(f"**{len(dashboards)}** dashboards")
+        if results_text:
+            st.info(f"📌 Showing {' and '.join(results_text)} for '{person_name}'")
+
+        # Calculate metrics
+        if work_items:
+            render_person_metrics(work_items, person_name)
+
+        # Display dashboards owned by person
+        if dashboards:
+            render_person_dashboards(dashboards, person_name)
+
+        # Display work items with ADO links
+        if work_items:
+            render_person_work_items(work_items)
+
+        # Option to view filtered dashboard
+        if work_items:
+            st.markdown("---")
+            st.markdown("### 📊 View Dashboard")
+            if st.button("🎯 View Filtered Dashboard for This Person", type="secondary"):
+                st.session_state.filter_mode = 'person'
+                st.session_state.filtered_work_items = work_items
+                st.info("💡 **Tip:** Switch to the '📊 Sprint Dashboard' tab to see detailed metrics and charts for this person's work items!")
+
+
+def render_person_metrics(work_items: List[Dict], person_name: str):
+    """Display metrics for person's work items"""
+
+    st.markdown("---")
+    st.markdown("### 📈 Metrics Overview")
+
+    # Calculate metrics
+    total_items = len(work_items)
+
+    # Count by state
+    state_counts = {}
+    type_counts = {}
+    total_story_points = 0
+    completed_story_points = 0
+
+    for item in work_items:
+        fields = item.get('fields', {})
+
+        # State
+        state = fields.get('System.State', 'Unknown')
+        state_counts[state] = state_counts.get(state, 0) + 1
+
+        # Type
+        work_item_type = fields.get('System.WorkItemType', 'Unknown')
+        type_counts[work_item_type] = type_counts.get(work_item_type, 0) + 1
+
+        # Story points
+        story_points = fields.get('Microsoft.VSTS.Scheduling.StoryPoints', 0) or 0
+        total_story_points += story_points
+
+        # Completed story points (Closed or Resolved states)
+        if state in ['Closed', 'Resolved', 'Done']:
+            completed_story_points += story_points
+
+    # Calculate completion rate
+    active_items = state_counts.get('Active', 0)
+    closed_items = state_counts.get('Closed', 0) + state_counts.get('Resolved', 0) + state_counts.get('Done', 0)
+    completion_rate = (closed_items / total_items * 100) if total_items > 0 else 0
+
+    # Display metrics in columns
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.metric("📋 Total Items", total_items)
+
+    with col2:
+        st.metric("⚡ Active", active_items)
+
+    with col3:
+        st.metric("✅ Completed", closed_items)
+
+    with col4:
+        st.metric("📊 Story Points", f"{int(total_story_points)}")
+
+    with col5:
+        st.metric("🎯 Completion Rate", f"{completion_rate:.1f}%")
+
+    # Display breakdown
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### 🔹 By State")
+        for state, count in sorted(state_counts.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / total_items * 100) if total_items > 0 else 0
+            st.markdown(f"- **{state}**: {count} ({percentage:.1f}%)")
+
+    with col2:
+        st.markdown("#### 🔸 By Type")
+        for wi_type, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / total_items * 100) if total_items > 0 else 0
+            st.markdown(f"- **{wi_type}**: {count} ({percentage:.1f}%)")
+
+
+def render_person_work_items(work_items: List[Dict]):
+    """Display person's work items with ADO links"""
+
+    st.markdown("---")
+    st.markdown("### 🔗 Work Items with ADO Links")
+
+    # Filters
+    col1, col2, col3 = st.columns(3)
+
+    # Get unique values for filters
+    all_states = set()
+    all_types = set()
+    all_iterations = set()
+
+    for item in work_items:
+        fields = item.get('fields', {})
+        all_states.add(fields.get('System.State', 'Unknown'))
+        all_types.add(fields.get('System.WorkItemType', 'Unknown'))
+        iteration = fields.get('System.IterationPath', 'Unknown')
+        if iteration:
+            all_iterations.add(iteration)
+
+    with col1:
+        state_filter = st.multiselect(
+            "Filter by State",
+            options=sorted(all_states),
+            default=[]
+        )
+
+    with col2:
+        type_filter = st.multiselect(
+            "Filter by Type",
+            options=sorted(all_types),
+            default=[]
+        )
+
+    with col3:
+        iteration_filter = st.multiselect(
+            "Filter by Iteration",
+            options=sorted(all_iterations),
+            default=[]
+        )
+
+    # Apply filters
+    filtered_items = work_items
+    if state_filter:
+        filtered_items = [item for item in filtered_items if item.get('fields', {}).get('System.State') in state_filter]
+    if type_filter:
+        filtered_items = [item for item in filtered_items if item.get('fields', {}).get('System.WorkItemType') in type_filter]
+    if iteration_filter:
+        filtered_items = [item for item in filtered_items if item.get('fields', {}).get('System.IterationPath') in iteration_filter]
+
+    st.markdown(f"Showing **{len(filtered_items)}** of **{len(work_items)}** work items")
+
+    # Display work items
+    for item in filtered_items:
+        fields = item.get('fields', {})
+        item_id = item.get('id')
+        title = fields.get('System.Title', 'No Title')
+        state = fields.get('System.State', 'Unknown')
+        work_item_type = fields.get('System.WorkItemType', 'Unknown')
+        story_points = fields.get('Microsoft.VSTS.Scheduling.StoryPoints', 0) or 0
+        iteration = fields.get('System.IterationPath', 'N/A')
+        area = fields.get('System.AreaPath', 'N/A')
+
+        # Generate ADO link
+        organization = st.session_state.ado_client.organization
+        project = st.session_state.ado_client.project
+        encoded_project = quote(project, safe='')
+        ado_link = f"https://dev.azure.com/{organization}/{encoded_project}/_workitems/edit/{item_id}"
+
+        # Display work item card
+        with st.container():
+            # Type and state badges
+            type_badge_class = {
+                'Epic': 'wi-epic',
+                'Feature': 'wi-feature',
+                'User Story': 'wi-story',
+                'Task': 'wi-task',
+                'Bug': 'wi-bug'
+            }.get(work_item_type, 'wi-task')
+
+            state_badge_class = {
+                'New': 'state-new',
+                'Active': 'state-active',
+                'Resolved': 'state-resolved',
+                'Closed': 'state-closed',
+                'Done': 'state-resolved'
+            }.get(state, 'state-new')
+
+            st.markdown(f"""
+            <div class="work-item-card">
+                <div>
+                    <span class="wi-badge {type_badge_class}">{work_item_type}</span>
+                    <span class="state-badge {state_badge_class}">{state}</span>
+                </div>
+                <div class="wi-title">#{item_id}: {title}</div>
+                <div style="margin-top: 8px; color: #605e5c;">
+                    <strong>📊 Story Points:</strong> {int(story_points) if story_points else 'N/A'} |
+                    <strong>🔄 Iteration:</strong> {iteration.split('\\')[-1] if iteration != 'N/A' else 'N/A'} |
+                    <strong>📁 Area:</strong> {area.split('\\')[-1] if area != 'N/A' else 'N/A'}
+                </div>
+                <div style="margin-top: 8px;">
+                    <a href="{ado_link}" target="_blank" style="color: #0078d4; text-decoration: none; font-weight: 600;">
+                        🔗 Open in Azure DevOps →
+                    </a>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    if not filtered_items:
+        st.info("No work items match the selected filters.")
+
+
+def render_person_dashboards(dashboards: List[Dict], person_name: str):
+    """Display dashboards owned by a person with ADO links"""
+
+    st.markdown("---")
+    st.markdown("### 📊 Dashboards Owned")
+    st.markdown(f"**{len(dashboards)}** dashboard(s) owned by {person_name}")
+
+    # Display each dashboard
+    for dashboard in dashboards:
+        dashboard_id = dashboard.get('id')
+        dashboard_name = dashboard.get('name', 'Unnamed Dashboard')
+        description = dashboard.get('description', 'No description')
+        team_name = dashboard.get('teamName', 'Unknown Team')
+        team_id = dashboard.get('teamId', '')
+
+        # Owner information
+        owner = dashboard.get('owner', {})
+        owner_name = owner.get('displayName', 'Unknown') if isinstance(owner, dict) else str(owner)
+
+        # Last modified
+        last_modified = dashboard.get('lastAccessedDate', 'N/A')
+
+        # Generate ADO dashboard link
+        organization = st.session_state.ado_client.organization
+        project = st.session_state.ado_client.project
+        encoded_project = quote(project, safe='')
+        encoded_team = quote(team_name, safe='')
+        dashboard_link = f"https://dev.azure.com/{organization}/{encoded_project}/{encoded_team}/_dashboards/dashboard/{dashboard_id}"
+
+        # Display dashboard card
+        with st.container():
+            st.markdown(f"""
+            <div class="work-item-card">
+                <div>
+                    <span class="wi-badge wi-feature">📊 Dashboard</span>
+                </div>
+                <div class="wi-title">{dashboard_name}</div>
+                <div style="margin-top: 8px; color: #605e5c;">
+                    <strong>📝 Description:</strong> {description if description else 'No description'}
+                </div>
+                <div style="margin-top: 8px; color: #605e5c;">
+                    <strong>👥 Team:</strong> {team_name} |
+                    <strong>👤 Owner:</strong> {owner_name}
+                </div>
+                <div style="margin-top: 8px;">
+                    <a href="{dashboard_link}" target="_blank" style="color: #0078d4; text-decoration: none; font-weight: 600;">
+                        🔗 Open Dashboard in Azure DevOps →
+                    </a>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("")  # Add spacing
+
+    if not dashboards:
+        st.info("No dashboards found.")
 
 
 if __name__ == "__main__":

@@ -388,6 +388,92 @@ class AzureDevOpsClient:
 
         return self.query_work_items_by_wiql(wiql_query)
 
+    def get_work_items_by_assignee(self, assignee_name: str) -> List[Dict]:
+        """
+        Get all work items assigned to a specific person.
+
+        Args:
+            assignee_name: Name of the person (can be partial, e.g., "Aditya" or "Aditya Rallapalli")
+
+        Returns:
+            list: List of work items assigned to the person
+        """
+        # WIQL supports CONTAINS operator for partial name matching
+        wiql_query = f"""
+        SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType],
+               [System.AssignedTo], [Microsoft.VSTS.Scheduling.StoryPoints],
+               [System.IterationPath], [System.AreaPath], [System.CreatedDate],
+               [System.ChangedDate], [System.Tags]
+        FROM WorkItems
+        WHERE [System.AssignedTo] CONTAINS '{assignee_name}'
+        AND [System.TeamProject] = '{self.project}'
+        ORDER BY [System.State], [System.WorkItemType]
+        """
+
+        return self.query_work_items_by_wiql(wiql_query)
+
+    def get_dashboards_by_owner(self, owner_name: str) -> List[Dict]:
+        """
+        Get all dashboards owned by a specific person.
+
+        Args:
+            owner_name: Name of the dashboard owner (can be partial)
+
+        Returns:
+            list: List of dashboards owned by the person
+        """
+        all_dashboards = []
+
+        try:
+            # First, get all teams in the project
+            teams_url = f"https://dev.azure.com/{self.organization}/_apis/projects/{quote(self.project, safe='')}/teams"
+            teams_params = {"api-version": "7.1"}
+
+            teams_response = requests.get(teams_url, headers=self.headers, params=teams_params)
+            teams_response.raise_for_status()
+            teams_data = teams_response.json()
+            teams = teams_data.get('value', [])
+
+            # For each team, get their dashboards
+            for team in teams:
+                team_id = team.get('id')
+                team_name = team.get('name')
+
+                try:
+                    # Get dashboards for this team
+                    dashboards_url = f"https://dev.azure.com/{self.organization}/{quote(self.project, safe='')}/{quote(team_id, safe='')}/_apis/dashboard/dashboards"
+                    dashboards_params = {"api-version": "7.1-preview.3"}
+
+                    dashboards_response = requests.get(dashboards_url, headers=self.headers, params=dashboards_params)
+                    dashboards_response.raise_for_status()
+                    dashboards_data = dashboards_response.json()
+
+                    # Add team name to each dashboard for reference
+                    for dashboard in dashboards_data.get('dashboardEntries', []):
+                        dashboard['teamName'] = team_name
+                        dashboard['teamId'] = team_id
+                        all_dashboards.append(dashboard)
+
+                except Exception as e:
+                    # Continue if we can't access a specific team's dashboards
+                    continue
+
+            # Filter dashboards by owner name
+            filtered_dashboards = []
+            for dashboard in all_dashboards:
+                owner = dashboard.get('owner', {})
+                owner_display_name = owner.get('displayName', '') if isinstance(owner, dict) else str(owner)
+
+                # Check if owner name matches (case-insensitive partial match)
+                if owner_name.lower() in owner_display_name.lower():
+                    filtered_dashboards.append(dashboard)
+
+            return filtered_dashboards
+
+        except Exception as e:
+            st.error(f"Error fetching dashboards: {str(e)}")
+            return []
+
 
 # Test the client
 if __name__ == "__main__":
