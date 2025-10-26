@@ -5,6 +5,7 @@ Generates summaries and technical solutions for Azure DevOps work items.
 """
 
 import os
+import re
 from typing import Dict, List
 from litellm import completion
 import json
@@ -183,7 +184,6 @@ Generate a detailed implementation plan that a developer can follow."""
         description = fields.get('System.Description', '')
         if description:
             # Strip HTML tags for cleaner context
-            import re
             clean_description = re.sub(r'<[^>]+>', '', description)
             context_parts.append(f"\n**Description**:\n{clean_description[:1000]}")
 

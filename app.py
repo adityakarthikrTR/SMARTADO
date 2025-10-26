@@ -13,6 +13,7 @@ from ado_client import AzureDevOpsClient
 from ai_analyzer import WorkItemAnalyzer
 from chatbot import WorkItemChatbot
 from sprint_dashboard import SprintAnalytics, MultiSprintAnalytics
+from dependency_graph import DependencyGraphBuilder
 import json
 import pandas as pd
 from urllib.parse import quote
@@ -390,34 +391,452 @@ def main():
         render_person_search()
 
 
+def organize_search_results_by_hierarchy(search_results: List[Dict]):
+    """
+    Organize search results into hierarchy groups (parent-child relationships) and orphans.
+
+    Args:
+        search_results: List of work items from search
+
+    Returns:
+        tuple: (hierarchies, orphans) where hierarchies is list of related groups, orphans is list of unrelated items
+    """
+    # Build a map of work items by ID
+    items_by_id = {item.get('id'): item for item in search_results}
+    item_ids = set(items_by_id.keys())
+
+    # Track which items belong to which group
+    groups = []
+    processed = set()
+
+    # Helper function to get parent/child IDs from relations
+    def get_related_ids(item):
+        """Extract parent and child IDs from work item relations"""
+        parents = set()
+        children = set()
+
+        relations = item.get('relations', [])
+        if relations:
+            for rel in relations:
+                rel_type = rel.get('rel', '')
+                url = rel.get('url', '')
+
+                # Extract work item ID from URL
+                if '/workitems/' in url:
+                    rel_id = int(url.split('/')[-1])
+
+                    if 'System.LinkTypes.Hierarchy-Reverse' in rel_type:  # Parent
+                        parents.add(rel_id)
+                    elif 'System.LinkTypes.Hierarchy-Forward' in rel_type:  # Child
+                        children.add(rel_id)
+
+        return parents, children
+
+    # Build groups by traversing relationships
+    for item in search_results:
+        item_id = item.get('id')
+
+        if item_id in processed:
+            continue
+
+        # Start a new group
+        group = []
+        to_process = [item_id]
+        group_members = set()
+
+        while to_process:
+            current_id = to_process.pop(0)
+
+            if current_id in group_members or current_id not in items_by_id:
+                continue
+
+            current_item = items_by_id[current_id]
+            group.append(current_item)
+            group_members.add(current_id)
+            processed.add(current_id)
+
+            # Get related items
+            parents, children = get_related_ids(current_item)
+
+            # Add related items that are in search results
+            for rel_id in parents | children:
+                if rel_id in item_ids and rel_id not in group_members:
+                    to_process.append(rel_id)
+
+        if len(group) > 1:
+            # Sort group by hierarchy level (Epic -> Feature -> User Story -> Task)
+            type_order = {'Epic': 0, 'Feature': 1, 'User Story': 2, 'Task': 3, 'Bug': 4}
+            group.sort(key=lambda x: type_order.get(x.get('fields', {}).get('System.WorkItemType', ''), 999))
+            groups.append(group)
+
+    # Collect orphans (items not in any group - includes single items and unprocessed items)
+    # Remove single items from processed set so they become orphans
+    items_in_groups = set()
+    for group in groups:
+        for item in group:
+            items_in_groups.add(item.get('id'))
+
+    orphans = [item for item in search_results if item.get('id') not in items_in_groups]
+
+    return groups, orphans
+
+
+def render_search_result_item(item: Dict, key_prefix: str):
+    """Render a single search result item with analyze button"""
+    fields = item.get('fields', {})
+    item_id = item.get('id')
+    title = fields.get('System.Title', 'No Title')
+    state = fields.get('System.State', 'Unknown')
+    work_item_type = fields.get('System.WorkItemType', 'Unknown')
+    assignee = fields.get('System.AssignedTo', {})
+    assignee_name = assignee.get('displayName', 'Unassigned') if isinstance(assignee, dict) else 'Unassigned'
+    iteration = fields.get('System.IterationPath', 'N/A')
+
+    # Type badge styling
+    type_badge_class = {
+        'Epic': 'wi-epic',
+        'Feature': 'wi-feature',
+        'User Story': 'wi-story',
+        'Task': 'wi-task',
+        'Bug': 'wi-bug'
+    }.get(work_item_type, 'wi-task')
+
+    state_badge_class = {
+        'New': 'state-new',
+        'Active': 'state-active',
+        'Resolved': 'state-resolved',
+        'Closed': 'state-closed',
+        'Done': 'state-resolved'
+    }.get(state, 'state-new')
+
+    col1, col2 = st.columns([4, 1])
+
+    with col1:
+        st.markdown(f"""
+        <div class="work-item-card">
+            <div>
+                <span class="wi-badge {type_badge_class}">{work_item_type}</span>
+                <span class="state-badge {state_badge_class}">{state}</span>
+            </div>
+            <div class="wi-title">#{item_id}: {title}</div>
+            <div style="margin-top: 8px; color: #605e5c;">
+                <strong>👤 Assigned:</strong> {assignee_name} |
+                <strong>🔄 Iteration:</strong> {iteration.split('\\')[-1] if iteration != 'N/A' else 'N/A'}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        if st.button(f"🔍 Analyze", key=f"analyze_{key_prefix}_{item_id}"):
+            st.session_state.selected_work_item_id = item_id
+            st.session_state.title_search_results = None
+            st.rerun()
+
+
+def render_hierarchy_group(hierarchy_group: List[Dict], group_key: str):
+    """Render a group of related work items in hierarchical order"""
+    # Build parent-child map
+    parent_map = {}  # child_id -> parent_id
+    children_map = {}  # parent_id -> [child_ids]
+
+    for item in hierarchy_group:
+        item_id = item.get('id')
+        relations = item.get('relations', [])
+
+        if relations:
+            for rel in relations:
+                rel_type = rel.get('rel', '')
+                url = rel.get('url', '')
+
+                if '/workitems/' in url:
+                    rel_id = int(url.split('/')[-1])
+
+                    if 'System.LinkTypes.Hierarchy-Reverse' in rel_type:  # This is the parent
+                        parent_map[item_id] = rel_id
+                        if rel_id not in children_map:
+                            children_map[rel_id] = []
+                        if item_id not in children_map[rel_id]:
+                            children_map[rel_id].append(item_id)
+                    elif 'System.LinkTypes.Hierarchy-Forward' in rel_type:  # This is a child
+                        if item_id not in children_map:
+                            children_map[item_id] = []
+                        if rel_id not in children_map[item_id]:
+                            children_map[item_id].append(rel_id)
+
+    # Find root items (no parents in this group)
+    items_by_id = {item.get('id'): item for item in hierarchy_group}
+    root_items = [item for item in hierarchy_group if item.get('id') not in parent_map]
+
+    # Render tree structure
+    def render_item_with_children(item, level=0):
+        item_id = item.get('id')
+        indent = "　　" * level  # Use full-width spaces for indentation
+
+        # Add tree symbols
+        if level > 0:
+            indent += "└─ "
+
+        fields = item.get('fields', {})
+        title = fields.get('System.Title', 'No Title')
+        state = fields.get('System.State', 'Unknown')
+        work_item_type = fields.get('System.WorkItemType', 'Unknown')
+
+        type_badge_class = {
+            'Epic': 'wi-epic',
+            'Feature': 'wi-feature',
+            'User Story': 'wi-story',
+            'Task': 'wi-task',
+            'Bug': 'wi-bug'
+        }.get(work_item_type, 'wi-task')
+
+        state_badge_class = {
+            'New': 'state-new',
+            'Active': 'state-active',
+            'Resolved': 'state-resolved',
+            'Closed': 'state-closed',
+            'Done': 'state-resolved'
+        }.get(state, 'state-new')
+
+        col1, col2 = st.columns([4, 1])
+
+        with col1:
+            st.markdown(f"""
+            <div class="work-item-card" style="margin-left: {level * 30}px;">
+                <div>
+                    <span class="wi-badge {type_badge_class}">{work_item_type}</span>
+                    <span class="state-badge {state_badge_class}">{state}</span>
+                </div>
+                <div class="wi-title">{indent}#{item_id}: {title}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col2:
+            st.markdown(f"<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
+            if st.button(f"🔍 Analyze", key=f"analyze_{group_key}_{item_id}"):
+                st.session_state.selected_work_item_id = item_id
+                st.session_state.title_search_results = None
+                st.rerun()
+
+        # Render children
+        child_ids = children_map.get(item_id, [])
+        for child_id in child_ids:
+            if child_id in items_by_id:
+                render_item_with_children(items_by_id[child_id], level + 1)
+
+    # Render from root items
+    for root_item in root_items:
+        render_item_with_children(root_item)
+
+
+def render_dependency_graph_section(hierarchy: Dict):
+    """Render the dependency graph visualization section"""
+
+    # Collect all work items from hierarchy
+    all_items = []
+
+    # Add main item
+    all_items.append(hierarchy['main'])
+
+    # Add parents
+    for parent in hierarchy.get('parents', []):
+        all_items.append(parent['data'])
+
+    # Add children
+    for child in hierarchy.get('children', []):
+        all_items.append(child['data'])
+
+    # Add related
+    for related in hierarchy.get('related', []):
+        all_items.append(related['data'])
+
+    if len(all_items) < 2:
+        # Don't show graph section at all if only 1 item
+        return
+
+    # Build dependency graph to check if relationships exist
+    graph_builder = DependencyGraphBuilder()
+    graph_builder.add_work_items(all_items)
+    stats = graph_builder.get_stats()
+
+    # Only show graph if there are actual relationships
+    if stats['total_relationships'] == 0:
+        # No relationships - don't show the graph section at all
+        return
+
+    # Show graph section header
+    st.markdown("## 🕸️ Dependency Graph Visualization")
+    st.markdown("*Visual network showing how work items are connected (parent-child, dependencies, blockers)*")
+
+    with st.spinner("🔄 Building dependency graph..."):
+        # Display stats
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📊 Work Items", stats['total_items'])
+        with col2:
+            st.metric("🔗 Relationships", stats['total_relationships'])
+        with col3:
+            st.metric("🚫 Blocked Items", stats['blocked_items'])
+        with col4:
+            st.metric("📏 Max Depth", stats['max_depth'])
+
+        # Show blocked items warning
+        if stats['blocked_items'] > 0:
+            blocked_items = graph_builder.get_blocked_items()
+            st.warning(f"⚠️ **{len(blocked_items)} work item(s) are blocked!**")
+            with st.expander("🚫 View Blocked Items"):
+                for item in blocked_items:
+                    st.markdown(f"- **#{item['id']}**: {item['title']} ({item['type']})")
+
+        # Create and display the graph
+        fig = graph_builder.create_plotly_figure()
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Legend
+        with st.expander("📖 Graph Legend - Click to Learn More"):
+            st.markdown("""
+            ### What am I looking at?
+            This graph shows **how work items are connected**:
+
+            **Nodes (Circles):**
+            - Each circle = 1 work item
+            - **Larger circles** = More story points
+            - **Colors**:
+                - 🔴 **Red** = Blocked (can't proceed, waiting on something)
+                - 🟠 **Orange** = Epic (large feature)
+                - 🟣 **Purple** = Feature (medium feature)
+                - 🔵 **Blue** = User Story
+                - 🟡 **Yellow** = Task
+                - Red = Bug
+
+            **Lines (Connections):**
+            - **Solid Blue Line** = Parent-Child (Epic → Feature → Story → Task)
+            - **Dashed Red Line** = Dependency (Item A blocks Item B)
+            - **Dotted Gray Line** = Related (items linked but not parent-child)
+
+            ### How to use this?
+            - **Hover** over circles to see details
+            - **Look for red circles** = These are blocked! Need attention!
+            - **Follow lines** to understand dependencies
+            """)
+
+        # Critical path
+        critical_path = graph_builder.get_critical_path()
+        if critical_path and len(critical_path) > 1:
+            st.info(f"🎯 **Critical Path** (longest dependency chain): {' → '.join([f'#{id}' for id in critical_path])}")
+
+
 def render_work_item_analyzer():
     """Render the Work Item Analyzer tab (original functionality)"""
 
-    # Main input
-    ado_url = st.text_input(
-        "🔗 Paste Azure DevOps URL",
-        placeholder="https://dev.azure.com/TR-Legal-Cobalt/Legal%20Cobalt%20Backlog/_workitems/edit/12345",
-        help="Enter any Azure DevOps work item URL (Epic, User Story, Task, Bug, etc.)"
+    # Add search mode selector
+    st.markdown("### 🔍 Search Work Items")
+    search_mode = st.radio(
+        "Choose search method:",
+        ["🔗 Search by URL", "📝 Search by Title"],
+        horizontal=True,
+        help="Search by URL for specific work item, or search by title to find matching items"
     )
-
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        analyze_button = st.button("🔍 Analyze Work Item", type="primary")
 
     # Initialize hierarchy storage
     if 'current_hierarchy' not in st.session_state:
         st.session_state.current_hierarchy = None
 
-    if analyze_button and ado_url:
-        # Parse URL
-        parsed = parse_ado_url(ado_url)
+    work_item_id = None
 
-        if not parsed or not parsed.get('work_item_id'):
-            st.error("❌ Invalid Azure DevOps URL. Please provide a valid work item URL.")
-            return
+    # Check if a work item was selected from search results
+    if 'selected_work_item_id' in st.session_state and st.session_state.selected_work_item_id:
+        work_item_id = st.session_state.selected_work_item_id
+        st.session_state.selected_work_item_id = None  # Clear after use
 
-        work_item_id = parsed['work_item_id']
+    # SEARCH BY URL MODE
+    if search_mode == "🔗 Search by URL":
+        # Main input
+        ado_url = st.text_input(
+            "🔗 Paste Azure DevOps URL",
+            placeholder="https://dev.azure.com/TR-Legal-Cobalt/Legal%20Cobalt%20Backlog/_workitems/edit/12345",
+            help="Enter any Azure DevOps work item URL (Epic, User Story, Task, Bug, etc.)"
+        )
 
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            analyze_button = st.button("🔍 Analyze Work Item", type="primary")
+
+        if analyze_button and ado_url:
+            # Parse URL
+            parsed = parse_ado_url(ado_url)
+
+            if not parsed or not parsed.get('work_item_id'):
+                st.error("❌ Invalid Azure DevOps URL. Please provide a valid work item URL.")
+                return
+
+            work_item_id = parsed['work_item_id']
+
+    # SEARCH BY TITLE MODE
+    elif search_mode == "📝 Search by Title":
+        # Title search input
+        title_search = st.text_input(
+            "📝 Enter work item title or keywords",
+            placeholder="e.g., Deep research, Login feature, Bug fix...",
+            help="Enter any keywords to search in work item titles (partial match supported)"
+        )
+
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            search_button = st.button("🔎 Search", type="primary", key="title_search_button")
+
+        if search_button and title_search:
+            if not title_search.strip():
+                st.warning("⚠️ Please enter a search term.")
+                return
+
+            with st.spinner(f"🔄 Searching for '{title_search}'..."):
+                try:
+                    # Search work items by title
+                    search_results = st.session_state.ado_client.search_work_items_by_title(title_search)
+
+                    if not search_results:
+                        st.warning(f"❌ No work items found matching '{title_search}'.")
+                        return
+
+                    # Store search results in session state
+                    st.session_state.title_search_results = search_results
+                    st.session_state.title_search_term = title_search
+
+                except Exception as e:
+                    st.error(f"❌ Error searching work items: {str(e)}")
+                    return
+
+        # Display search results if they exist
+        if 'title_search_results' in st.session_state and st.session_state.title_search_results:
+            search_results = st.session_state.title_search_results
+            search_term = st.session_state.get('title_search_term', '')
+
+            st.success(f"✅ Found **{len(search_results)}** work items matching '{search_term}'")
+
+            st.markdown("---")
+            st.markdown("### 📋 Search Results")
+            st.markdown("Click 'Analyze' to view full details and hierarchy for any work item:")
+
+            # Organize results into hierarchies
+            hierarchies, orphans = organize_search_results_by_hierarchy(search_results)
+
+            # Display hierarchical groups
+            if hierarchies:
+                st.markdown("#### 🌳 Related Work Items (Grouped by Hierarchy)")
+                for group_idx, hierarchy_group in enumerate(hierarchies):
+                    with st.expander(f"📦 Group {group_idx + 1} - {len(hierarchy_group)} items", expanded=True):
+                        render_hierarchy_group(hierarchy_group, f"group_{group_idx}")
+
+            # Display orphaned/unrelated items
+            if orphans:
+                st.markdown("#### 📄 Other Work Items (Not Related)")
+                for item in orphans:
+                    render_search_result_item(item, f"orphan_{item.get('id')}")
+
+            return  # Don't show hierarchy yet, wait for user selection
+
+    # If we have a work_item_id (from either URL or title search), fetch and analyze it
+    if work_item_id:
         with st.spinner(f"🔄 Fetching work item #{work_item_id}..."):
             # Fetch work item
             hierarchy = st.session_state.ado_client.get_work_item_hierarchy(work_item_id)
@@ -471,6 +890,10 @@ def render_work_item_analyzer():
                     render_work_item_card(related['data'], show_details=False)
             else:
                 st.info("No related work items")
+
+        # Dependency Graph Visualization
+        st.markdown("---")
+        render_dependency_graph_section(hierarchy)
 
         # AI Analysis Section
         st.markdown("---")
@@ -1882,7 +2305,7 @@ def render_person_search():
 
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)
-        search_button = st.button("🔎 Search", type="primary")
+        search_button = st.button("🔎 Search", type="primary", key="person_search_button")
 
     # Perform search
     if search_button and person_name:
@@ -1902,93 +2325,156 @@ def render_person_search():
                     st.warning(f"❌ No work items or dashboards found for '{person_name}'. Please check the name and try again.")
                     return
 
-                # Store in session state for dashboard view
-                st.session_state.person_work_items = work_items
-                st.session_state.person_dashboards = dashboards
-                st.session_state.person_search_name = person_name
-
-                # Display results
-                results_text = []
-                if work_items:
-                    results_text.append(f"**{len(work_items)}** work items")
-                if dashboards:
-                    results_text.append(f"**{len(dashboards)}** dashboards")
-                st.success(f"✅ Found {' and '.join(results_text)} for '{person_name}'")
-
-                # Extract unique assignee name from results (to get full name)
-                assignee_names = set()
+                # Extract unique assignee names from results
+                assignee_data = {}  # {display_name: {email, unique_name}}
                 for item in work_items:
                     assignee = item.get('fields', {}).get('System.AssignedTo', {})
                     if isinstance(assignee, dict):
-                        full_name = assignee.get('displayName', '')
-                        if full_name:
-                            assignee_names.add(full_name)
+                        display_name = assignee.get('displayName', '')
+                        if display_name:
+                            assignee_data[display_name] = {
+                                'email': assignee.get('uniqueName', ''),
+                                'id': assignee.get('id', '')
+                            }
 
-                if assignee_names:
-                    st.info(f"📌 **Matched assignees:** {', '.join(assignee_names)}")
+                # Add dashboard owners
+                for dashboard in dashboards:
+                    owner = dashboard.get('owner', {})
+                    if isinstance(owner, dict):
+                        display_name = owner.get('displayName', '')
+                        if display_name and display_name not in assignee_data:
+                            assignee_data[display_name] = {
+                                'email': owner.get('uniqueName', ''),
+                                'id': owner.get('id', '')
+                            }
 
-                # Calculate metrics
-                if work_items:
-                    render_person_metrics(work_items, person_name)
+                if not assignee_data:
+                    st.warning(f"❌ No matching persons found for '{person_name}'.")
+                    return
 
-                # Display dashboards owned by person
-                if dashboards:
-                    render_person_dashboards(dashboards, person_name)
+                # Store all results temporarily
+                st.session_state.person_search_results = {
+                    'work_items': work_items,
+                    'dashboards': dashboards,
+                    'assignee_data': assignee_data,
+                    'search_term': person_name
+                }
 
-                # Display work items with ADO links
-                if work_items:
-                    render_person_work_items(work_items)
+                # Clear any previous selection
+                if 'selected_person_name' in st.session_state:
+                    del st.session_state.selected_person_name
 
-                # Option to view filtered dashboard
-                if work_items:
-                    st.markdown("---")
-                    st.markdown("### 📊 View Dashboard")
-                if st.button("🎯 View Filtered Dashboard for This Person", type="secondary"):
+            except Exception as e:
+                st.error(f"❌ Error searching: {str(e)}")
+                return
+
+    # Display person selector if we have search results
+    if 'person_search_results' in st.session_state:
+        results = st.session_state.person_search_results
+        assignee_data = results['assignee_data']
+        search_term = results['search_term']
+
+        # Show how many people matched
+        st.success(f"✅ Found **{len(assignee_data)}** person(s) matching '{search_term}'")
+
+        # Check if person already selected
+        person_already_selected = 'selected_person_name' in st.session_state and st.session_state.selected_person_name in assignee_data
+
+        # Person selector (only show if no selection yet)
+        if len(assignee_data) > 1 and not person_already_selected:
+            st.markdown("---")
+            st.markdown("### 👥 Multiple People Found - Select One:")
+
+            # Display each person as a card with a select button
+            for person_name, person_info in assignee_data.items():
+                col1, col2 = st.columns([4, 1])
+
+                with col1:
+                    email = person_info.get('email', 'N/A')
+                    st.markdown(f"""
+                    <div class="work-item-card">
+                        <div class="wi-title">👤 {person_name}</div>
+                        <div style="margin-top: 8px; color: #605e5c;">
+                            <strong>📧 Email:</strong> {email}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with col2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button(f"Select", key=f"select_{person_name}", type="primary"):
+                        st.session_state.selected_person_name = person_name
+                        st.rerun()
+
+            return  # Wait for selection
+
+        elif len(assignee_data) == 1:
+            # Only one person, auto-select
+            st.session_state.selected_person_name = list(assignee_data.keys())[0]
+
+        # Display selected person's details
+        if 'selected_person_name' in st.session_state:
+            selected_person = st.session_state.selected_person_name
+            work_items = results['work_items']
+            dashboards = results['dashboards']
+
+            # Filter work items for selected person only
+            person_work_items = [
+                item for item in work_items
+                if item.get('fields', {}).get('System.AssignedTo', {}).get('displayName', '') == selected_person
+            ]
+
+            # Filter dashboards for selected person only
+            person_dashboards = [
+                dashboard for dashboard in dashboards
+                if dashboard.get('owner', {}).get('displayName', '') == selected_person
+            ]
+
+            # Show selected person info
+            st.markdown("---")
+            person_info = assignee_data[selected_person]
+            st.info(f"📌 **Selected:** {selected_person} ({person_info.get('email', 'N/A')})")
+
+            if len(assignee_data) > 1:
+                if st.button("🔄 Change Selection"):
+                    del st.session_state.selected_person_name
+                    st.rerun()
+
+            # Display results count
+            results_text = []
+            if person_work_items:
+                results_text.append(f"**{len(person_work_items)}** work items")
+            if person_dashboards:
+                results_text.append(f"**{len(person_dashboards)}** dashboards")
+
+            if results_text:
+                st.success(f"Found {' and '.join(results_text)} for {selected_person}")
+            else:
+                st.warning(f"No work items or dashboards found for {selected_person}")
+                return
+
+            # Calculate metrics
+            if person_work_items:
+                render_person_metrics(person_work_items, selected_person)
+
+            # Display dashboards owned by person
+            if person_dashboards:
+                render_person_dashboards(person_dashboards, selected_person)
+
+            # Display work items with ADO links
+            if person_work_items:
+                render_person_work_items(person_work_items)
+
+            # Option to view filtered dashboard
+            if person_work_items:
+                st.markdown("---")
+                st.markdown("### 📊 View Dashboard")
+                if st.button("🎯 View Filtered Dashboard for This Person", type="secondary", key="dashboard_btn"):
                     # Set filter mode to person
                     st.session_state.filter_mode = 'person'
                     st.session_state.filtered_work_items = work_items
                     # Switch to sprint dashboard tab would require rerun with tab selection
                     st.info("💡 **Tip:** Switch to the '📊 Sprint Dashboard' tab to see detailed metrics and charts for this person's work items!")
-
-            except Exception as e:
-                st.error(f"❌ Error searching for work items: {str(e)}")
-                return
-
-    # If there's existing search results, show them
-    elif 'person_work_items' in st.session_state or 'person_dashboards' in st.session_state:
-        work_items = st.session_state.get('person_work_items', [])
-        dashboards = st.session_state.get('person_dashboards', [])
-        person_name = st.session_state.get('person_search_name', 'Unknown')
-
-        # Display results summary
-        results_text = []
-        if work_items:
-            results_text.append(f"**{len(work_items)}** work items")
-        if dashboards:
-            results_text.append(f"**{len(dashboards)}** dashboards")
-        if results_text:
-            st.info(f"📌 Showing {' and '.join(results_text)} for '{person_name}'")
-
-        # Calculate metrics
-        if work_items:
-            render_person_metrics(work_items, person_name)
-
-        # Display dashboards owned by person
-        if dashboards:
-            render_person_dashboards(dashboards, person_name)
-
-        # Display work items with ADO links
-        if work_items:
-            render_person_work_items(work_items)
-
-        # Option to view filtered dashboard
-        if work_items:
-            st.markdown("---")
-            st.markdown("### 📊 View Dashboard")
-            if st.button("🎯 View Filtered Dashboard for This Person", type="secondary"):
-                st.session_state.filter_mode = 'person'
-                st.session_state.filtered_work_items = work_items
-                st.info("💡 **Tip:** Switch to the '📊 Sprint Dashboard' tab to see detailed metrics and charts for this person's work items!")
 
 
 def render_person_metrics(work_items: List[Dict], person_name: str):

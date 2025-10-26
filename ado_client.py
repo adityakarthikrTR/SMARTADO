@@ -351,7 +351,7 @@ class AzureDevOpsClient:
                 details_url = f"https://dev.azure.com/{_self.organization}/_apis/wit/workitems"
                 details_params = {
                     "ids": ids_param,
-                    "$expand": "all",
+                    "$expand": "relations",  # Must explicitly request relations
                     "api-version": "7.0"
                 }
 
@@ -408,6 +408,30 @@ class AzureDevOpsClient:
         WHERE [System.AssignedTo] CONTAINS '{assignee_name}'
         AND [System.TeamProject] = '{self.project}'
         ORDER BY [System.State], [System.WorkItemType]
+        """
+
+        return self.query_work_items_by_wiql(wiql_query)
+
+    def search_work_items_by_title(self, title_search: str) -> List[Dict]:
+        """
+        Search for work items by title using partial matching.
+
+        Args:
+            title_search: Search string to match in work item titles (partial match)
+
+        Returns:
+            list: List of work items matching the search term
+        """
+        # WIQL supports CONTAINS operator for partial title matching
+        wiql_query = f"""
+        SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType],
+               [System.AssignedTo], [Microsoft.VSTS.Scheduling.StoryPoints],
+               [System.IterationPath], [System.AreaPath], [System.CreatedDate],
+               [System.ChangedDate], [System.Tags]
+        FROM WorkItems
+        WHERE [System.Title] CONTAINS '{title_search}'
+        AND [System.TeamProject] = '{self.project}'
+        ORDER BY [System.ChangedDate] DESC
         """
 
         return self.query_work_items_by_wiql(wiql_query)
