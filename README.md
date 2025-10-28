@@ -78,7 +78,7 @@ ADO_PAT=YOUR_PERSONAL_ACCESS_TOKEN_HERE
 
 # LiteLLM Configuration (already configured for TR)
 LITELLM_API_BASE=https://litellm.int.thomsonreuters.com
-LITELLM_API_KEY=sk-zlR9TXis42IY0AuSRvU9Cw
+LITELLM_API_KEY=YOUR_LITELLM_API_KEY_HERE
 LITELLM_MODEL=gpt-4
 ```
 
